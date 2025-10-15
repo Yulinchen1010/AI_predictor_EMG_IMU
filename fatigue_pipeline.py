@@ -443,9 +443,7 @@ def main():
     if missing:
         raise ValueError(f"缺少必備欄位：{missing}")
 
-    df_aug = augment_with_high_fatigue(df_raw)
-
-    df_proc = run_pipeline(df_aug)
+    df_proc = run_pipeline(df_raw)
     df_proc.to_csv("fatigue_processed.csv", index=False)
     print("Saved fatigue_processed.csv")
 
