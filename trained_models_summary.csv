@@ -1,0 +1,4 @@
+name,sklearn_class
+bin_log,LogisticRegression
+bin_hgb,HistGradientBoostingClassifier
+tri_hgb,HistGradientBoostingClassifier
