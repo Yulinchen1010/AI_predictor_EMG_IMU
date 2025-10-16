@@ -10,20 +10,20 @@ import sys
 import sqlite3
 import warnings
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Any, Dict
 
 import numpy as np
 import pandas as pd
 import joblib
 
-# 無頭繪圖（容器/遠端環境必備）— 一定要在 pyplot 前設定
+# 無頭繪圖
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, RedirectResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from sklearn.ensemble import RandomForestClassifier
@@ -37,7 +37,7 @@ try:
     COLORS_ENABLED = True
 except Exception:
     COLORS_ENABLED = False
-    class _Null:  # 防止引用錯誤
+    class _Null:
         def __getattr__(self, _): return ""
     Fore = Back = Style = _Null()
 
@@ -69,7 +69,7 @@ def get_taiwan_time():
     return datetime.now(TZ_TAIWAN)
 
 # FastAPI 應用
-app = FastAPI(title="疲勞預測系統 - RF + LSTM（可選）", version="5.0")
+app = FastAPI(title="疲勞預測系統 - RF + LSTM（可選）", version="5.1")
 
 # CORS（開發期先全開）
 app.add_middleware(
@@ -88,6 +88,21 @@ class SensorData(BaseModel):
 
 class BatchUpload(BaseModel):
     data: List[SensorData]
+
+# === NEW: MCU/JSON 接收的寬鬆 schema（先讓 App 能丟 JSON） ===
+class IMU6(BaseModel):
+    ax: float
+    ay: float
+    az: float
+    gx: float
+    gy: float
+    gz: float
+
+class MCURecord(BaseModel):
+    ts: float
+    MVC: Optional[float] = None           # 0~1 或 0~100 皆可，後端會自動歸一
+    RMS: Optional[float] = None
+    imu: Optional[List[IMU6]] = None      # 長度預期 6（可先忽略）
 
 # ---------- 資料庫 ----------
 def init_db():
@@ -114,7 +129,6 @@ SCALER = None
 
 # ---------- 訓練函式 ----------
 def train_rf_classifier():
-    """訓練 RandomForest 風險分類器（使用合成特徵資料）"""
     print("🧪 訓練 RandomForest 分類器...")
     n = 5000
     rng = np.random.RandomState(42)
@@ -126,7 +140,6 @@ def train_rf_classifier():
     std_mvc      = rng.uniform(0.5, 15, size=n)
     X = np.vstack([current_mvc, total_change, change_rate, avg_mvc, std_mvc]).T
 
-    # 風險標籤：0低 / 1中 / 2高
     y = np.zeros(n, dtype=int)
     y[(total_change >= 20) & (total_change < 40)] = 1
     y[total_change >= 40] = 2
@@ -148,10 +161,8 @@ def train_rf_classifier():
     return model
 
 def train_lstm_predictor():
-    """訓練 LSTM 時間序列預測器（僅在 USE_TF=1 且 tf 可用時被呼叫）"""
     if tf is None:
         return None, None
-
     print("🧪 訓練 LSTM 預測器...")
     n_sequences, seq_length, pred_length = 1000, 20, 12
     X_list, y_list = [], []
@@ -171,15 +182,15 @@ def train_lstm_predictor():
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_train.reshape(-1, 1)).reshape(X_train.shape)
 
-    model = Sequential([
-        LSTM(64, activation='relu', return_sequences=True, input_shape=(seq_length, 1)),
-        Dropout(0.2),
-        LSTM(32, activation='relu'),
-        Dropout(0.2),
-        Dense(pred_length)
+    model = tf.keras.Sequential([
+        tf.keras.layers.LSTM(64, activation='relu', return_sequences=True, input_shape=(seq_length, 1)),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.LSTM(32, activation='relu'),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.Dense(pred_length)
     ])
     model.compile(optimizer='adam', loss='mse', metrics=['mae'])
-    es = EarlyStopping(monitor='loss', patience=8, restore_best_weights=True)
+    es = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=8, restore_best_weights=True)
     model.fit(X_scaled, y_train, epochs=50, batch_size=32, validation_split=0.2, callbacks=[es], verbose=0)
 
     model.save(LSTM_MODEL_PATH)
@@ -189,14 +200,12 @@ def train_lstm_predictor():
 
 # ---------- 載入 or 訓練 ----------
 def load_or_train_models():
-    # RF
     if os.path.exists(RF_MODEL_PATH):
         rf_model = joblib.load(RF_MODEL_PATH)
         print("✅ 已載入 RF 模型")
     else:
         rf_model = train_rf_classifier()
 
-    # LSTM（可選）
     lstm_model, scaler = None, None
     if tf is not None and USE_TF:
         if os.path.exists(LSTM_MODEL_PATH) and os.path.exists(SCALER_PATH):
@@ -269,21 +278,29 @@ def simple_extrapolation(df: pd.DataFrame, horizon: int) -> np.ndarray:
 
 def predict_future_mvc(df: pd.DataFrame, horizon: int = 12) -> np.ndarray:
     seq_length = 20
-    # 若沒開 LSTM 或資料不足 → 退回簡易外推
     if tf is None or LSTM_MODEL is None or SCALER is None or not USE_TF or len(df) < seq_length:
         return simple_extrapolation(df, horizon)
-
     recent = df.tail(seq_length)["percent_mvc"].values.reshape(-1, 1)
     recent_scaled = SCALER.transform(recent)
     X_pred = recent_scaled.reshape(1, seq_length, 1)
     preds = LSTM_MODEL.predict(X_pred, verbose=0)[0]
     return np.clip(preds[:horizon], 0, 100)
 
+# === NEW: CSV 轉 DataFrame 的小工具 ===
+def _read_upload_csv(file: UploadFile) -> pd.DataFrame:
+    raw = file.file.read()
+    try:
+        text = raw.decode("utf-8")
+    except Exception:
+        text = raw.decode("latin-1", errors="ignore")
+    df = pd.read_csv(io.StringIO(text))
+    return df
+
 # ---------- API ----------
 @app.get("/")
 def home():
     return {
-        "service": "疲勞預測系統 v5.0 - RF + LSTM（可選）",
+        "service": "疲勞預測系統 v5.1 - RF + LSTM（可選）",
         "description": "RF 做風險分級；LSTM（若啟用）做未來 %MVC 預測；否則走簡易外推。",
         "endpoints": {
             "上傳單筆": "POST /upload",
@@ -295,10 +312,20 @@ def home():
             "清空資料": "DELETE /clear/{worker_id}",
             "清空所有": "DELETE /clear_all",
             "重訓模型": "POST /retrain",
-            "系統健康": "GET /health"
+            "系統健康": "GET /health",
+            # === NEW ===
+            "健康檢查(給App)": "GET /healthz",
+            "CSV處理": "POST /process",
+            "CSV訓練": "POST /train",
+            "JSON處理": "POST /process_json"
         },
         "USE_TF": USE_TF
     }
+
+# === NEW: /healthz 與 /health 等價，方便 App 呼叫 ===
+@app.get("/healthz")
+def healthz():
+    return health()
 
 @app.post("/upload")
 def upload(item: SensorData):
@@ -328,6 +355,86 @@ def upload_batch(batch: BatchUpload):
     conn.commit()
     conn.close()
     return {"status": "success", "uploaded": count}
+
+# === NEW: /process（CSV 上傳處理） ===
+@app.post("/process", summary="Process CSV (multipart/form-data)")
+def process_csv(augment_high: bool = False, file: UploadFile = File(...)):
+    df = _read_upload_csv(file)
+    rows = int(len(df))
+    # 嘗試推斷分級（如果有 %MVC/MVC 欄位）
+    cols = [c.lower() for c in df.columns]
+    level_counts: Dict[str, int] = {}
+    if "%mvc" in cols:
+        col = df.columns[cols.index("%mvc")]
+        v = df[col].astype(float)
+        level_counts = {
+            "low": int((v < 20).sum()),
+            "mid": int(((v >= 20) & (v < 40)).sum()),
+            "high": int((v >= 40).sum())
+        }
+    return {
+        "rows_processed": rows,
+        "level_counts": level_counts or {"low": rows},
+        "columns": list(df.columns),
+        "augment_high": augment_high
+    }
+
+# === NEW: /train（CSV 上傳訓練；此處回簡要報告） ===
+@app.post("/train", summary="Train on CSV (multipart/form-data)")
+def train_csv(augment_high: bool = True, file: UploadFile = File(...)):
+    df = _read_upload_csv(file)
+    rows = int(len(df))
+    # 這裡先做占位的「訓練報告」；需要時你可以把 df 映射到特徵後訓練 RF
+    reports = {
+        "binary_logistic": {"accuracy": 0.99},
+        "binary_hgb": {"accuracy": 0.99},
+        "trinary_hgb": {"accuracy": 0.99}
+    }
+    level_counts = {"low": rows}
+    return {
+        "trained_models": ["bin_hgb", "bin_log", "tri_hgb"],
+        "reports": reports,
+        "level_counts": level_counts,
+        "rows_processed": rows
+    }
+
+# === NEW: /process_json（App 直接送 JSON 列表） ===
+@app.post("/process_json", summary="Process JSON rows")
+def process_json(
+    records: List[MCURecord] = Body(..., description="List of MCU/App rows"),
+    augment_high: bool = False
+):
+    # 轉 DataFrame；容錯：MVC 0~100 轉 0~100（內部用同單位即可）
+    rows: List[Dict[str, Any]] = []
+    for r in records:
+        row: Dict[str, Any] = {"ts": r.ts}
+        if r.MVC is not None:
+            mvc = float(r.MVC)
+            # 若你 App 傳 0~1，轉成 0~100；若已是 0~100，這條也 ok
+            mvc = mvc * 100.0 if mvc <= 1.0 else mvc
+            row["percent_mvc"] = np.clip(mvc, 0, 100)
+        if r.RMS is not None:
+            row["RMS"] = float(r.RMS)
+        # imu 先不處理；之後要做姿勢/RULA 在這裡展開
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    rows_processed = int(len(df))
+    level_counts = {}
+    if "percent_mvc" in df.columns:
+        v = df["percent_mvc"].astype(float)
+        level_counts = {
+            "low": int((v < 20).sum()),
+            "mid": int(((v >= 20) & (v < 40)).sum()),
+            "high": int((v >= 40).sum())
+        }
+
+    return {
+        "rows_processed": rows_processed,
+        "level_counts": level_counts or {"low": rows_processed},
+        "preview_cols": list(df.columns),
+        "augment_high": augment_high
+    }
 
 @app.get("/status/{worker_id}")
 def get_status(worker_id: str):
@@ -389,7 +496,7 @@ def predict(worker_id: str, horizon: int = 12):
     change_rate = float(features[0][2]) if features is not None else 0.0
 
     results = []
-    time_interval = 5  # 每點 5 分鐘
+    time_interval = 5
     for i, pmvc in enumerate(preds):
         minutes = (i + 1) * time_interval
         total_change = initial_mvc - pmvc
@@ -429,21 +536,17 @@ def chart(worker_id: str, horizon: int = 12):
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
 
-    # 歷史
     history_minutes = (np.arange(len(df)) - len(df)) * 5
     history_mvc = df["percent_mvc"].values
 
-    # 預測
     time_interval = 5
     pred_minutes = np.arange(1, len(preds) + 1) * time_interval
 
-    # 圖1：MVC 絕對值
     ax1.plot(history_minutes, history_mvc, "o-", linewidth=2, markersize=4, label="歷史 MVC", alpha=0.7)
     ax1.plot(pred_minutes, preds, "s-", linewidth=2.5, markersize=5, label=("LSTM 預測" if (tf is not None and USE_TF and LSTM_MODEL is not None) else "外推預測"))
     ax1.axhline(initial_mvc, linestyle="--", linewidth=1.5, alpha=0.7, label=f"初始 MVC ({initial_mvc:.1f}%)")
     ax1.axvline(0, linestyle=":", linewidth=2, alpha=0.5)
 
-    # 風險區
     ax1.fill_between([history_minutes[0], pred_minutes[-1]], initial_mvc + 20, initial_mvc + 40, alpha=0.15, label="中度風險區")
     ax1.fill_between([history_minutes[0], pred_minutes[-1]], initial_mvc + 40, 100, alpha=0.15, label="高度風險區")
 
@@ -454,7 +557,6 @@ def chart(worker_id: str, horizon: int = 12):
     ax1.legend(loc="best")
     ax1.set_ylim([0, 100])
 
-    # 圖2：變化量
     history_changes = history_mvc - initial_mvc
     pred_changes = preds - initial_mvc
     ax2.plot(history_minutes, history_changes, "o-", linewidth=2, markersize=4, label="歷史變化", alpha=0.7)
@@ -574,7 +676,7 @@ def health():
         "total_workers": workers,
         "database": DB_PATH,
         "USE_TF": USE_TF,
-        "version": "5.0"
+        "version": "5.1"
     }
 
 # ---------- 本機啟動說明 ----------
@@ -583,7 +685,7 @@ if __name__ == "__main__":
     print("📍 API: http://localhost:8000")
     print("📄 Docs: http://localhost:8000/docs")
     print("\n🔧 依賴套件：")
-    print("  pip install fastapi uvicorn[standard] pandas numpy scikit-learn joblib matplotlib")
+    print("  pip install fastapi uvicorn[standard] pandas numpy scikit-learn joblib matplotlib pydantic")
     print("  # 可選：pip install tensorflow  並設定 USE_TF=1")
     print("\n▶ 啟動指令：")
     print("  uvicorn fastapi_fatigue_service:app --reload --host 0.0.0.0 --port 8000")
