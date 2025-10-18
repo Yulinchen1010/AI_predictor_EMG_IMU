@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: fatigue-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: starter
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: MODELS_DIR
+        value: /var/data/models         # 告訴程式把模型存這
+    disk:
+      name: model-store
+      mountPath: /var/data              # 整顆碟掛在 /var/data
+      sizeGB: 5                          # 依需求調整容量（付費）
