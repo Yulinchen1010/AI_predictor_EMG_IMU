@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>疲勞預測系統儀表板</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            color: #667eea;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: #666;
+            font-size: 1.1em;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 5px 15px;
+            background: #667eea;
+            color: white;
+            border-radius: 20px;
+            font-size: 0.9em;
+            margin-top: 10px;
+        }
+
+        .card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 20px;
+        }
+
+        .card h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            font-size: 1.8em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .input-group {
+            margin-bottom: 20px;
+        }
+
+        .input-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 600;
+        }
+
+        .input-group input, .input-group select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+
+        .input-group input:focus, .input-group select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 14px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            width: 100%;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn-secondary {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            margin-top: 10px;
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            margin-top: 10px;
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #ff6b6b 0%, #c92a2a 100%);
+            margin-top: 10px;
+        }
+
+        .btn-danger:hover {
+            box-shadow: 0 5px 15px rgba(201, 42, 42, 0.4);
+        }
+
+        .btn-small {
+            padding: 8px 16px;
+            font-size: 14px;
+            width: auto;
+        }
+
+        .status-card {
+            background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        .status-item {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .status-item .label {
+            color: #666;
+            font-size: 0.9em;
+            margin-bottom: 5px;
+        }
+
+        .status-item .value {
+            color: #333;
+            font-size: 1.5em;
+            font-weight: bold;
+        }
+
+        .risk-high {
+            color: #e74c3c;
+        }
+
+        .risk-medium {
+            color: #f39c12;
+        }
+
+        .risk-low {
+            color: #27ae60;
+        }
+
+        .recommendation-box {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            border-left: 4px solid #667eea;
+        }
+
+        .recommendation-box h4 {
+            color: #333;
+            margin-bottom: 8px;
+        }
+
+        .recommendation-box p {
+            color: #666;
+            line-height: 1.6;
+        }
+
+        .chart-container {
+            margin-top: 20px;
+            text-align: center;
+        }
+
+        .chart-container img {
+            max-width: 100%;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+
+        .workers-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        .worker-item {
+            background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+            padding: 15px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: transform 0.2s;
+            border-left: 5px solid transparent;
+            position: relative;
+        }
+
+        .worker-item:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .worker-item.risk-high-border {
+            border-left-color: #e74c3c;
+        }
+
+        .worker-item.risk-medium-border {
+            border-left-color: #f39c12;
+        }
+
+        .worker-item.risk-low-border {
+            border-left-color: #27ae60;
+        }
+
+        .worker-item h3 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .worker-item p {
+            color: #666;
+            font-size: 0.9em;
+            margin: 5px 0;
+        }
+
+        .worker-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .loading {
+            text-align: center;
+            color: #667eea;
+            font-size: 1.2em;
+            padding: 20px;
+        }
+
+        .error {
+            background: #fee;
+            color: #c33;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+        }
+
+        .success {
+            background: #efe;
+            color: #3c3;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+        }
+
+        .info-box {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #2196f3;
+        }
+
+        .info-box h4 {
+            color: #1976d2;
+            margin-bottom: 8px;
+        }
+
+        .info-box p {
+            color: #555;
+            line-height: 1.6;
+            margin: 5px 0;
+        }
+
+        .two-column {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        @media (max-width: 968px) {
+            .two-column {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .mvc-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .mvc-bar {
+            flex: 1;
+            height: 20px;
+            background: #e0e0e0;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        .mvc-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #27ae60, #f39c12, #e74c3c);
+            transition: width 0.3s;
+        }
+
+        .auto-refresh {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 15px;
+            padding: 10px;
+            background: #f5f5f5;
+            border-radius: 8px;
+        }
+
+        .auto-refresh label {
+            color: #666;
+            font-weight: 600;
+        }
+
+        .auto-refresh input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        .stats-summary {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-box {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+        }
+
+        .stat-box .number {
+            font-size: 2.5em;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .stat-box .label {
+            font-size: 0.9em;
+            opacity: 0.9;
+        }
+
+        /* 模態框樣式 */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            animation: fadeIn 0.3s;
+        }
+
+        .modal.active {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-content {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            max-width: 500px;
+            width: 90%;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+            animation: slideDown 0.3s;
+        }
+
+        .modal-content h3 {
+            color: #e74c3c;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+        }
+
+        .modal-content p {
+            color: #666;
+            margin-bottom: 20px;
+            line-height: 1.6;
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+
+        .modal-actions button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+
+        .modal-actions .btn-cancel {
+            background: #e0e0e0;
+            color: #333;
+        }
+
+        .modal-actions .btn-confirm {
+            background: linear-gradient(135deg, #ff6b6b 0%, #c92a2a 100%);
+            color: white;
+        }
+
+        .modal-actions button:hover {
+            transform: translateY(-2px);
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes slideDown {
+            from { transform: translateY(-50px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        @media (max-width: 768px) {
+            .stats-summary {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🏭 疲勞預測系統儀表板</h1>
+            <p>基於 MVC 百分比的即時疲勞風險監測</p>
+        </div>
+
+        <div class="info-box">
+            <h4>📱 系統說明</h4>
+            <p>✅ <strong>APP 自動上傳:</strong> 系統設計為由 APP 端每分鐘自動上傳 MVC 數據</p>
+            <p>✅ <strong>風險計算:</strong> 根據 MVC 變化量評估疲勞風險 (初始值 vs 當前值)</p>
+            <p>✅ <strong>風險等級:</strong> 低度 (&lt;20%) | 中度 (20-40%) | 高度 (≥40%)</p>
+        </div>
+
+        <div class="two-column">
+            <!-- 左側：測試與管理 -->
+            <div>
+                <div class="card">
+                    <h2>🧪 測試資料生成</h2>
+                    <p style="color: #666; margin-bottom: 15px;">模擬 APP 每分鐘自動上傳數據</p>
+                    <div class="input-group">
+                        <label>工作者 ID</label>
+                        <input type="text" id="testWorkerId" placeholder="例如: worker001" value="worker001">
+                    </div>
+                    <div class="input-group">
+                        <label>生成數據筆數 (分鐘數)</label>
+                        <input type="number" id="testCount" min="1" max="100" value="30" placeholder="建議 20-50 筆">
+                    </div>
+                    <button class="btn btn-success" onclick="generateTestData()">生成測試資料</button>
+                    <div id="testResult"></div>
+                </div>
+
+                
+
+                <div class="card">
+                    <h2>👥 所有工作者列表</h2>
+                    <div class="auto-refresh">
+                        <input type="checkbox" id="autoRefresh" onchange="toggleAutoRefresh()">
+                        <label for="autoRefresh">自動刷新 (每30秒)</label>
+                    </div>
+                    <button class="btn btn-secondary" onclick="loadWorkers()">手動重新載入</button>
+                    <div id="workersList"></div>
+                </div>
+            </div>
+
+            <!-- 右側：查詢與預測 -->
+            <div>
+                <div class="card">
+                    <h2>🔍 查詢工作者狀態</h2>
+                    <div class="input-group">
+                        <label>工作者 ID</label>
+                        <input type="text" id="queryWorkerId" placeholder="輸入 worker_id" value="worker001">
+                    </div>
+                    <button class="btn" onclick="getStatus()">查詢即時狀態</button>
+                    <button class="btn btn-secondary" onclick="showChart()">顯示預測圖表</button>
+                    <div id="statusResult"></div>
+                </div>
+
+                <div class="card">
+                    <h2>📊 MVC 變化預測圖表</h2>
+                    <div id="chartContainer">
+                        <p style="color: #999; text-align: center; padding: 40px;">
+                            請先查詢工作者狀態，然後點擊「顯示預測圖表」
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 確認刪除模態框 -->
+    <div id="deleteModal" class="modal">
+        <div class="modal-content">
+            <h3>⚠️ 確認刪除</h3>
+            <p id="modalMessage"></p>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeModal()">取消</button>
+                <button class="btn-confirm" onclick="executeDelete()">確認刪除</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000';
+        let autoRefreshInterval = null;
+        let deleteAction = null; // 存儲待執行的刪除操作
+
+        // 生成測試資料
+        async function generateTestData() {
+            const workerId = document.getElementById('testWorkerId').value;
+            const count = parseInt(document.getElementById('testCount').value);
+
+            if (!workerId || isNaN(count) || count < 1) {
+                showMessage('testResult', '請填寫正確的工作者 ID 和數據筆數', 'error');
+                return;
+            }
+
+            try {
+                showMessage('testResult', '生成中，請稍候...', 'loading');
+                
+                const response = await fetch(`${API_BASE}/test/generate/${workerId}?count=${count}`, {
+                    method: 'POST'
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showMessage('testResult', `✅ ${data.message}`, 'success');
+                    loadWorkers();
+                    
+                    // 自動載入該工作者的狀態
+                    document.getElementById('queryWorkerId').value = workerId;
+                    setTimeout(() => getStatus(), 500);
+                } else {
+                    showMessage('testResult', `❌ 生成失敗: ${data.detail}`, 'error');
+                }
+            } catch (error) {
+                showMessage('testResult', `❌ 連線錯誤: ${error.message}`, 'error');
+            }
+        }
+
+        // 確認刪除工作者
+        function confirmDeleteWorker() {
+            const workerId = document.getElementById('deleteWorkerId').value;
+            
+            if (!workerId) {
+                showMessage('deleteResult', '請輸入工作者 ID', 'error');
+                return;
+            }
+
+            deleteAction = {
+                type: 'worker',
+                workerId: workerId
+            };
+
+            document.getElementById('modalMessage').innerHTML = `
+                <strong>確定要刪除工作者 "${workerId}" 的所有資料嗎？</strong><br><br>
+                此操作無法復原！
+            `;
+            document.getElementById('deleteModal').classList.add('active');
+        }
+
+        // 確認清空所有資料
+        function confirmDeleteAll() {
+            deleteAction = {
+                type: 'all'
+            };
+
+            document.getElementById('modalMessage').innerHTML = `
+                <strong style="color: #e74c3c;">⚠️ 警告：確定要清空所有資料嗎？</strong><br><br>
+                這將刪除系統中所有工作者的全部記錄！<br>
+                此操作無法復原！
+            `;
+            document.getElementById('deleteModal').classList.add('active');
+        }
+
+        // 執行刪除
+        async function executeDelete() {
+            closeModal();
+
+            if (!deleteAction) return;
+
+            try {
+                let response;
+                let resultElement = 'deleteResult';
+
+                if (deleteAction.type === 'worker') {
+                    showMessage(resultElement, '刪除中，請稍候...', 'loading');
+                    response = await fetch(`${API_BASE}/clear/${deleteAction.workerId}`, {
+                        method: 'DELETE'
+                    });
+                } else if (deleteAction.type === 'all') {
+                    showMessage(resultElement, '清空中，請稍候...', 'loading');
+                    response = await fetch(`${API_BASE}/clear_all`, {
+                        method: 'DELETE'
+                    });
+                }
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    showMessage(resultElement, `✅ ${data.message} (刪除 ${data.deleted} 筆)`, 'success');
+                    
+                    // 清空輸入框
+                    document.getElementById('deleteWorkerId').value = '';
+                    
+                    // 重新載入列表
+                    loadWorkers();
+                    
+                    // 如果刪除的是當前查詢的工作者，清空狀態顯示
+                    if (deleteAction.type === 'worker' && 
+                        document.getElementById('queryWorkerId').value === deleteAction.workerId) {
+                        document.getElementById('statusResult').innerHTML = '';
+                        document.getElementById('chartContainer').innerHTML = `
+                            <p style="color: #999; text-align: center; padding: 40px;">
+                                請先查詢工作者狀態，然後點擊「顯示預測圖表」
+                            </p>
+                        `;
+                    }
+                } else {
+                    showMessage(resultElement, `❌ 刪除失敗: ${data.detail}`, 'error');
+                }
+            } catch (error) {
+                showMessage('deleteResult', `❌ 連線錯誤: ${error.message}`, 'error');
+            }
+
+            deleteAction = null;
+        }
+
+        // 關閉模態框
+        function closeModal() {
+            document.getElementById('deleteModal').classList.remove('active');
+            deleteAction = null;
+        }
+
+        // 快速刪除工作者（從列表點擊）
+        async function quickDeleteWorker(workerId) {
+            if (!confirm(`確定要刪除工作者 "${workerId}" 的所有資料嗎？\n\n此操作無法復原！`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/clear/${workerId}`, {
+                    method: 'DELETE'
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    console.log(`✅ 已刪除 ${workerId} (${data.deleted} 筆)`);
+                    loadWorkers();
+                } else {
+                    alert(`刪除失敗: ${data.detail}`);
+                }
+            } catch (error) {
+                alert(`連線錯誤: ${error.message}`);
+            }
+        }
+
+        // 載入所有工作者
+        async function loadWorkers() {
+            const container = document.getElementById('workersList');
+            container.innerHTML = '<div class="loading">載入中...</div>';
+
+            try {
+                const response = await fetch(`${API_BASE}/workers`);
+                const data = await response.json();
+
+                if (data.workers && data.workers.length > 0) {
+                    container.innerHTML = '<div class="workers-list">' +
+                        data.workers.map(worker => {
+                            const riskClass = worker.risk_level === '高度' ? 'risk-high-border' : 
+                                            worker.risk_level === '中度' ? 'risk-medium-border' : 'risk-low-border';
+                            const riskColor = worker.risk_level === '高度' ? 'risk-high' : 
+                                            worker.risk_level === '中度' ? 'risk-medium' : 'risk-low';
+                            
+                            return `
+                                <div class="worker-item ${riskClass}">
+                                    <div onclick="selectWorker('${worker.worker_id}')">
+                                        <h3>👤 ${worker.worker_id}</h3>
+                                        <p>📊 資料筆數: <strong>${worker.count}</strong></p>
+                                        <p>📈 平均 MVC: <strong>${worker.avg_mvc}%</strong></p>
+                                        <p>📉 MVC 範圍: ${worker.min_mvc}% - ${worker.max_mvc}%</p>
+                                        <p>⚠️ MVC 變化: <strong>${worker.mvc_range}%</strong></p>
+                                        <p class="${riskColor}">🎯 風險等級: <strong>${worker.risk_level}</strong></p>
+                                        <p style="font-size: 0.85em;">🕐 ${formatTime(worker.last_update)}</p>
+                                    </div>
+                                    <div class="worker-actions">
+                                        <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); quickDeleteWorker('${worker.worker_id}')">
+                                            🗑️ 刪除
+                                        </button>
+                                    </div>
+                                </div>
+                            `;
+                        }).join('') +
+                        '</div>';
+                } else {
+                    container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">尚無資料，請先生成測試資料</p>';
+                }
+            } catch (error) {
+                container.innerHTML = `<div class="error">載入失敗: ${error.message}</div>`;
+            }
+        }
+
+        // 選擇工作者
+        function selectWorker(workerId) {
+            document.getElementById('queryWorkerId').value = workerId;
+            getStatus();
+        }
+
+        // 查詢即時狀態
+        async function getStatus() {
+            const workerId = document.getElementById('queryWorkerId').value;
+            const container = document.getElementById('statusResult');
+
+            if (!workerId) {
+                showMessage('statusResult', '請輸入工作者 ID', 'error');
+                return;
+            }
+
+            container.innerHTML = '<div class="loading">查詢中...</div>';
+
+            try {
+                const response = await fetch(`${API_BASE}/status/${workerId}`);
+                const data = await response.json();
+
+                if (response.ok) {
+                    const riskClass = data.risk_level === 3 ? 'risk-high' : 
+                                     data.risk_level === 2 ? 'risk-medium' : 'risk-low';
+                    
+                    const mvcChangePercent = (data.mvc_change / 100) * 100;
+                    
+                    container.innerHTML = `
+                        <div class="status-card">
+                            <h3 style="margin-bottom: 15px;">📋 工作者: ${data.worker_id}</h3>
+                            <div class="status-grid">
+                                <div class="status-item">
+                                    <div class="label">初始 MVC</div>
+                                    <div class="value">${data.initial_mvc}%</div>
+                                </div>
+                                <div class="status-item">
+                                    <div class="label">當前 MVC</div>
+                                    <div class="value">${data.current_mvc}%</div>
+                                </div>
+                                <div class="status-item">
+                                    <div class="label">MVC 變化</div>
+                                    <div class="value ${data.mvc_change > 0 ? 'risk-high' : 'risk-low'}">
+                                        ${data.mvc_change > 0 ? '+' : ''}${data.mvc_change}%
+                                    </div>
+                                </div>
+                                <div class="status-item">
+                                    <div class="label">變化率</div>
+                                    <div class="value">${data.mvc_change_rate}% /分</div>
+                                </div>
+                                <div class="status-item">
+                                    <div class="label">風險等級</div>
+                                    <div class="value ${riskClass}">${data.fatigue_risk}</div>
+                                </div>
+                                <div class="status-item">
+                                    <div class="label">工作時間</div>
+                                    <div class="value">${data.time_elapsed_minutes} 分</div>
+                                </div>
+                                <div class="status-item">
+                                    <div class="label">近期平均</div>
+                                    <div class="value">${data.recent_avg_mvc}%</div>
+                                </div>
+                                <div class="status-item">
+                                    <div class="label">資料筆數</div>
+                                    <div class="value">${data.data_count}</div>
+                                </div>
+                            </div>
+                            
+                            <div class="mvc-indicator">
+                                <span style="font-weight: 600;">MVC 指示:</span>
+                                <div class="mvc-bar">
+                                    <div class="mvc-bar-fill" style="width: ${data.current_mvc}%"></div>
+                                </div>
+                                <span style="font-weight: 600;">${data.current_mvc}%</span>
+                            </div>
+                            
+                            <div class="recommendation-box">
+                                <h4>💡 系統建議</h4>
+                                <p>${data.recommendation}</p>
+                                <p style="margin-top: 8px; font-size: 0.9em;">
+                                    最後更新: ${formatTime(data.last_update)}
+                                </p>
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    container.innerHTML = `<div class="error">查詢失敗: ${data.detail}</div>`;
+                }
+            } catch (error) {
+                container.innerHTML = `<div class="error">連線錯誤: ${error.message}</div>`;
+            }
+        }
+
+        // 顯示預測圖表
+        async function showChart() {
+            const workerId = document.getElementById('queryWorkerId').value;
+            const container = document.getElementById('chartContainer');
+
+            if (!workerId) {
+                container.innerHTML = '<div class="error">請先輸入工作者 ID</div>';
+                return;
+            }
+
+            container.innerHTML = '<div class="loading">載入圖表中...</div>';
+
+            try {
+                const timestamp = new Date().getTime();
+                const imgUrl = `${API_BASE}/chart/${workerId}?horizon=120&t=${timestamp}`;
+                
+                container.innerHTML = `
+                    <div class="chart-container">
+                        <img src="${imgUrl}" alt="MVC 變化預測圖表" onerror="this.parentElement.innerHTML='<div class=error>圖表載入失敗，請確認工作者 ID 是否正確</div>'">
+                        <p style="margin-top: 15px; color: #666;">
+                            📈 預測範圍: 未來 120 分鐘 | 工作者: <strong>${workerId}</strong>
+                        </p>
+                        <p style="color: #999; font-size: 0.9em;">
+                            圖表顯示 MVC 絕對值預測與變化量趨勢
+                        </p>
+                    </div>
+                `;
+            } catch (error) {
+                container.innerHTML = `<div class="error">載入失敗: ${error.message}</div>`;
+            }
+        }
+
+        // 自動刷新開關
+        function toggleAutoRefresh() {
+            const checkbox = document.getElementById('autoRefresh');
+            
+            if (checkbox.checked) {
+                loadWorkers();
+                autoRefreshInterval = setInterval(() => {
+                    loadWorkers();
+                    const workerId = document.getElementById('queryWorkerId').value;
+                    if (workerId) {
+                        getStatus();
+                    }
+                }, 30000); // 30秒
+                
+                console.log('✅ 自動刷新已啟用 (每30秒)');
+            } else {
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                    autoRefreshInterval = null;
+                }
+                console.log('❌ 自動刷新已停用');
+            }
+        }
+
+        // 顯示訊息
+        function showMessage(elementId, message, type) {
+            const element = document.getElementById(elementId);
+            const className = type === 'loading' ? 'loading' : type;
+            element.innerHTML = `<div class="${className}">${message}</div>`;
+            
+            if (type !== 'loading') {
+                setTimeout(() => {
+                    element.innerHTML = '';
+                }, 5000);
+            }
+        }
+
+        // 格式化時間
+        function formatTime(timestamp) {
+            if (!timestamp) return 'N/A';
+            const date = new Date(timestamp);
+            return date.toLocaleString('zh-TW', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+
+        // 頁面載入時自動載入工作者列表
+        window.onload = function() {
+            console.log('🚀 疲勞預測系統儀表板已載入');
+            console.log('📡 API 位址:', API_BASE);
+            loadWorkers();
+            
+            // 檢查 API 健康狀態
+            fetch(`${API_BASE}/health`)
+                .then(res => res.json())
+                .then(data => {
+                    console.log('✅ API 健康檢查:', data);
+                })
+                .catch(err => {
+                    console.error('❌ API 連線失敗:', err);
+                    alert('⚠️ 無法連接到後端 API，請確認伺服器是否啟動');
+                });
+        };
+
+        // 清理自動刷新
+        window.onbeforeunload = function() {
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+            }
+        };
+
+        // 點擊模態框外部關閉
+        window.onclick = function(event) {
+            const modal = document.getElementById('deleteModal');
+            if (event.target === modal) {
+                closeModal();
+            }
+        };
+    </script>
+</body>
+</html>
