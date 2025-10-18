@@ -307,6 +307,12 @@ def upload(item: SensorData):
     }
 
 # ==================== 健康檢查 ====================
+@app.get("/healthz")
+def healthz():
+    # 回用 /health 的資訊也可以：
+    # return health()
+    return {"status": "ok"}
+
 @app.get('/health')
 def health():
     conn = sqlite3.connect(DB_PATH)
@@ -341,4 +347,5 @@ if __name__ == '__main__':
     print("📍 本機: http://localhost:8000")
     print("📍 App 端點: http://localhost:8000/app_data")
     print("\n🎯 啟動命令:")
+
     print("  uvicorn main:app --reload --host 0.0.0.0 --port 8000")
