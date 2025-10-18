@@ -650,6 +650,13 @@ def health():
         "version": "5.1 - Enhanced Prediction"
     }
 
+@app.get("/healthz")
+def healthz():
+    # 回用 /health 的資訊也可以：
+    # return health()
+    return {"status": "ok"}
+
+
 if __name__ == '__main__':
     print("🚀 疲勞預測系統 v5.1 已啟動")
     print("📍 本機: http://localhost:8000")
@@ -661,3 +668,4 @@ if __name__ == '__main__':
     print("  ✅ 全域參數統一設定: 方便調整時間參數")
     print("\n🎯 啟動命令:")
     print("  uvicorn main:app --reload --host 0.0.0.0 --port 8000")
+
