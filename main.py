@@ -32,15 +32,15 @@ APP_BUILD = (
 # 模型檔案
 MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 RF_MODEL_PATH = os.path.join(MODEL_DIR, "rf_classifier.pkl")
-SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")  # 保留給 LSTM/特徵縮放擴充
+SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")  # 預留：若將來要做縮放/LSTM
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # 使用者（如果 App 沒傳 worker_id，就用這個）
 DEFAULT_WORKER_ID = os.environ.get("DEFAULT_WORKER_ID", "user001")
 
-# 風險層級 → 顏色與標籤
+# 風險層級 → 顏色與標籤（改成前端慣用色票）
 RISK_LABELS = ["低度", "中度", "高度"]
-RISK_COLORS = ["#18b358", "#f1a122", "#e74533"]  # 綠、橘、紅
+RISK_COLORS = ["#22C55E", "#F59E0B", "#EF4444"]  # 綠、橘、紅
 
 # 感測器輸出最大值提示（若無設定，稍後會依資料自動推斷）
 try:
@@ -56,13 +56,19 @@ except Exception:
 # 台灣時區
 TZ_TAIWAN = timezone(timedelta(hours=8))
 
+# 常數：型別名稱與篩選門檻
+HEARTBEAT_TYPE = "heartbeat"
+MIN_EFFECTIVE_PCT = 0.1  # 低於此值視為近似 0，不納入特徵
+# 若收到異常小的 UNIX 秒（例如 56.545 秒被誤當 epoch），以 2000-01-01 作為「合理界線」
+UNREASONABLE_EPOCH_SEC = datetime(2000, 1, 1, tzinfo=timezone.utc).timestamp()
+
 
 def now_taiwan_iso() -> str:
     return datetime.now(TZ_TAIWAN).isoformat()
 
 
 # ==================== FastAPI ====================
-app = FastAPI(title=APP_TITLE, version="v1.1")
+app = FastAPI(title=APP_TITLE, version="v1.2")
 
 # CORS 設定：預設全開（支援以逗號分隔的允許來源）
 app.add_middleware(
@@ -101,7 +107,7 @@ def init_db() -> None:
             percent_mvc REAL NOT NULL,
             ts REAL,               -- UNIX seconds，可空
             rms REAL,              -- 預留 EMG RMS，非必填
-            type TEXT              -- 來源/類型（例如 'heartbeat' / 'mvc' / 'emg'）
+            type TEXT              -- 來源/類型（例如 'heartbeat' / 'mvc' / 'emg' / 'imu'）
         )
         """
     )
@@ -117,6 +123,7 @@ def init_db() -> None:
             pass
 
     c.execute("CREATE INDEX IF NOT EXISTS idx_worker_ts ON sensor_data(worker_id, timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_type_ts ON sensor_data(type, timestamp)")
     conn.commit()
     conn.close()
 
@@ -146,19 +153,19 @@ async def log_requests(request: Request, call_next):
 async def unhandled_ex_handler(request: Request, exc: Exception):
     import traceback
 
-    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
     logger.error(f"[UNHANDLED] {request.url.path} {exc}\n{tb}")
     if isinstance(exc, HTTPException):
         detail = exc.detail
         if not isinstance(detail, dict):
             detail = {"detail": detail}
-        return JSONResponse(status_code=exc.status_code, content=detail, headers=exc.headers)
+        return JSONResponse(status_code=exc.status_code, content=detail, headers=getattr(exc, "headers", None))
     return JSONResponse(status_code=500, content={"error": "internal_error", "detail": str(exc)})
 
 
 # ==================== 請求模型 ====================
 class SensorData(BaseModel):
-    percent_mvc: float = Field(ge=0, le=100)
+    percent_mvc: float = Field(ge=0, le=120)  # 正規化後允許些微超 100
     timestamp: Optional[str] = None  # ISO-8601
 
 
@@ -176,6 +183,24 @@ def _to_ts_sec(v: Any) -> float:
         return datetime.utcnow().timestamp()
 
 
+def _safe_iso_from_ts(ts_sec: Optional[float]) -> str:
+    """
+    將 ts（UNIX 秒或 None）轉為 ISO-8601 UTC。
+    若 ts 秒數明顯不合理（如 56.545），改用現在時間防呆。
+    """
+    if ts_sec is None:
+        ts_sec = datetime.utcnow().timestamp()
+    try:
+        tsf = float(ts_sec)
+    except Exception:
+        tsf = datetime.utcnow().timestamp()
+
+    if tsf < UNREASONABLE_EPOCH_SEC:  # 早於 2000-01-01 視為不合理
+        tsf = datetime.utcnow().timestamp()
+
+    return datetime.utcfromtimestamp(tsf).replace(tzinfo=timezone.utc).isoformat()
+
+
 def _clean_numeric(v: Any) -> Optional[float]:
     try:
         if v is None:
@@ -186,7 +211,7 @@ def _clean_numeric(v: Any) -> Optional[float]:
 
 
 def _infer_mvc_scale(values: List[Optional[float]]) -> float:
-    """根據資料決定原始 MVC 的最大刻度。"""
+    """根據資料決定原始 MVC 的最大刻度（推斷 0..1 / 0..20 / 0..100 這種）。"""
     if MVC_SENSOR_MAX_HINT:
         return MVC_SENSOR_MAX_HINT
 
@@ -204,7 +229,7 @@ def _infer_mvc_scale(values: List[Optional[float]]) -> float:
     return max(100.0, max_val)
 
 
-def _mvc_to_percent(raw_value: float, scale: float) -> float:
+def _mvc_to_percent(raw_value: Optional[float], scale: float) -> float:
     if raw_value is None:
         return 0.0
     try:
@@ -219,8 +244,7 @@ def _mvc_to_percent(raw_value: float, scale: float) -> float:
         percent = (value / scale) * 100.0
     if percent < 0:
         percent = 0.0
-    # 允許些微超過 100，避免推斷刻度時過度截斷
-    return float(min(percent, 120.0))
+    return float(min(percent, 120.0))  # 允許些微超 100，避免過度截斷
 
 
 def _to_float(v: Any) -> Optional[float]:
@@ -245,10 +269,10 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     容錯鍵名並轉成 DB 欄位：
     - worker_id：預設 DEFAULT_WORKER_ID
     - percent_mvc：容忍 MVC(0..1/0..100)、percent_mvc、mvc、emg_pct（自動推斷刻度後換算為 0..100）
-    - timestamp：ISO；若沒給，用 ts（秒）或現在
+    - timestamp：ISO；若沒給，用 ts（秒）或現在；並防呆修正「不合理的 epoch」
     - ts：UNIX 秒
     - rms：容忍 RMS/emg_rms/rms/emg
-    - type：原樣保留
+    - type：原樣保留（heartbeat / mvc / emg / imu）
     """
     out: List[Dict[str, Any]] = []
     raw_mvc_values: List[Optional[float]] = []
@@ -274,7 +298,7 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             ts_sec = _to_ts_sec(mm["timestamp"])
         else:
             ts_sec = _to_ts_sec(mm.get("ts"))
-        iso = datetime.utcfromtimestamp(ts_sec).replace(tzinfo=timezone.utc).isoformat()
+        iso = _safe_iso_from_ts(ts_sec)
 
         # RMS（可選）
         rms = None
@@ -282,7 +306,6 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if k in mm and rms is None:
                 rms = _to_float(mm.get(k))
 
-        # 類型（可選）
         typ = str(mm.get("type")) if mm.get("type") is not None else None
 
         out.append(
@@ -290,7 +313,7 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "worker_id": worker_id,
                 "timestamp": iso,
                 "percent_mvc": _mvc_to_percent(raw_mvc, scale) if raw_mvc is not None else 0.0,
-                "ts": ts_sec,
+                "ts": float(ts_sec) if ts_sec is not None else None,
                 "rms": rms,
                 "type": typ,
             }
@@ -344,28 +367,57 @@ RF_MODEL: RandomForestClassifier = _load_or_train_rf()
 
 
 # ==================== 特徵計算 & 風險評分 ====================
-def _get_df(worker_id: str, limit: int = 600) -> pd.DataFrame:
+def _get_df(worker_id: str, limit: int = 600, exclude_heartbeat: bool = True) -> pd.DataFrame:
+    """
+    拉資料（預設排除 heartbeat），取最新 limit 筆，再轉回時間正序。
+    """
     conn = get_conn()
-    df = pd.read_sql_query(
-        "SELECT * FROM sensor_data WHERE worker_id = ? ORDER BY timestamp DESC LIMIT ?",
-        conn,
-        params=(worker_id, int(limit)),
-    )
+    if exclude_heartbeat:
+        sql = """
+        SELECT * FROM sensor_data
+        WHERE worker_id = ? AND (type IS NULL OR type != ?)
+        ORDER BY timestamp DESC LIMIT ?
+        """
+        params = (worker_id, HEARTBEAT_TYPE, int(limit))
+    else:
+        sql = """
+        SELECT * FROM sensor_data
+        WHERE worker_id = ?
+        ORDER BY timestamp DESC LIMIT ?
+        """
+        params = (worker_id, int(limit))
+
+    df = pd.read_sql_query(sql, conn, params=params)
     conn.close()
+
     if not df.empty:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        df = df.dropna(subset=["timestamp"])
         df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
 
 def _extract_features(df: pd.DataFrame) -> Optional[np.ndarray]:
+    """
+    只用 percent_mvc 的時間序列特徵：
+    current_mvc, total_change(初始到當前降幅), change_rate(最近10筆/分鐘),
+    avg_mvc, std_mvc
+    - 過濾 heartbeat 與近似 0 的 %MVC
+    """
+    if df.empty:
+        return None
+
+    # 防守性：二次過濾
+    if "type" in df.columns:
+        df = df[df["type"].ne(HEARTBEAT_TYPE)]
+
+    df = df[df["percent_mvc"] > MIN_EFFECTIVE_PCT].copy()
     if len(df) < 2:
         return None
 
-    # 以第一筆與最後一筆推估總降幅；並用最近 10 筆估算變化速率
     first_mvc = float(df.iloc[0]["percent_mvc"])
     last_mvc = float(df.iloc[-1]["percent_mvc"])
-    initial_mvc = max(first_mvc, df["percent_mvc"].max())
+    initial_mvc = max(first_mvc, float(df["percent_mvc"].max()))
     current_mvc = last_mvc
     total_change = float(initial_mvc - current_mvc)
 
@@ -386,8 +438,8 @@ def _extract_features(df: pd.DataFrame) -> Optional[np.ndarray]:
 
 def _predict_risk(features: np.ndarray) -> Tuple[str, int, str, np.ndarray]:
     """
-    回傳：(label, level, color, proba)
-    level: 0=低 1=中 2=高
+    回傳：(label, level012, color, proba)
+    level012: 0=低 1=中 2=高
     """
     level = int(RF_MODEL.predict(features)[0])
     proba = RF_MODEL.predict_proba(features)[0]
@@ -395,7 +447,7 @@ def _predict_risk(features: np.ndarray) -> Tuple[str, int, str, np.ndarray]:
 
 
 def _level13_from_012(level012: int) -> int:
-    # 後端若要 1/2/3：把 0/1/2 轉 1/2/3
+    # 對外 1/2/3
     return int(level012) + 1
 
 
@@ -404,7 +456,7 @@ def _level13_from_012(level012: int) -> int:
 def home():
     return {
         "service": APP_TITLE,
-        "version": "v1.1",
+        "version": "v1.2",
         "build": APP_BUILD,
         "endpoints": {
             "健康檢查": "GET /healthz",
@@ -413,6 +465,7 @@ def home():
             "單筆上傳": "POST /upload",
             "批次上傳": "POST /process_json",
             "查詢狀態": "GET /status/{worker_id}",
+            "清空資料": "DELETE /clear/{worker_id}",
         },
     }
 
@@ -432,8 +485,8 @@ def health():
     return {
         "status": "healthy",
         "db": {"path": DB_PATH, "total_records": total},
-        "models": {"rf_loaded": RF_MODEL is not None},
-        "version": "v1.1",
+        "models": {"rf_loaded": RF_MODEL is not None, "rf_path": RF_MODEL_PATH},
+        "version": "v1.2",
         "build": APP_BUILD,
     }
 
@@ -459,7 +512,7 @@ def upload(item: SensorData):
 # ---- App 簡化端點（只返回三個欄位）----
 @app.get("/app_data")
 def get_app_data():
-    df = _get_df(DEFAULT_WORKER_ID, limit=120)
+    df = _get_df(DEFAULT_WORKER_ID, limit=120, exclude_heartbeat=True)
     if df.empty:
         return {"user_id": DEFAULT_WORKER_ID, "last_update": None, "risk_level": "無資料"}
 
@@ -476,9 +529,8 @@ def get_app_data():
 def process_json(rows: Union[List[Dict[str, Any]], Dict[str, Any]]):
     payload = _ensure_json_array(rows)
 
-    # 不論來源欄位配置為何，統一正規化與刻度換算
+    # 正規化 + 刻度換算 + 時間修正（防 1970）
     normalized = _normalize_rows(payload)
-
     if not normalized:
         raise HTTPException(400, detail="空的上傳資料")
 
@@ -517,7 +569,7 @@ def process_json(rows: Union[List[Dict[str, Any]], Dict[str, Any]]):
     # 回傳同時附上最新風險等級（方便 App 立即更新）
     if last_worker is None:
         last_worker = DEFAULT_WORKER_ID
-    df = _get_df(last_worker, limit=120)
+    df = _get_df(last_worker, limit=120, exclude_heartbeat=True)
     if df.empty:
         resp = {"status": "ok", "inserted": inserted, "worker_id": last_worker}
     else:
@@ -537,7 +589,7 @@ def process_json(rows: Union[List[Dict[str, Any]], Dict[str, Any]]):
                 "worker_id": last_worker,
                 "risk": {
                     "label": label012,
-                    "level": _level13_from_012(level012),  # 轉 1/2/3
+                    "level": _level13_from_012(level012),  # 1/2/3
                     "color": color,
                     "prob": [float(x) for x in proba],
                 },
@@ -549,7 +601,7 @@ def process_json(rows: Union[List[Dict[str, Any]], Dict[str, Any]]):
 @app.get("/status/{worker_id}")
 def status(worker_id: str):
     wid = str((worker_id or DEFAULT_WORKER_ID)).strip()
-    df = _get_df(wid, limit=120)
+    df = _get_df(wid, limit=120, exclude_heartbeat=True)
     if df.empty:
         return {
             "worker_id": wid,
