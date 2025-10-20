@@ -262,6 +262,23 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         raw_mvc_values.append(raw_mvc)
 
         # 時間
+    out: List[Dict[str, Any]] = []
+    for m in rows:
+        mm = dict(m)
+
+        raw_wid = mm.get("worker_id") or DEFAULT_WORKER_ID
+        worker_id = str(raw_wid).strip()
+
+        # MVC
+        mvc = None
+        for k in ("percent_mvc", "MVC", "mvc", "emg_pct"):
+            if k in mm and mvc is None:
+                mvc = _to_mvc_0_100(mm.get(k))
+        if mvc is None:
+            # 沒給 MVC 也允許（例如純 RMS），但 /upload/process_json 仍會接受
+            pass
+
+        # 時間
         if "timestamp" in mm and mm["timestamp"]:
             ts_sec = _to_ts_sec(mm["timestamp"])
         else:
@@ -474,6 +491,8 @@ def process_json(rows: Union[List[Dict[str, Any]], Dict[str, Any]]):
 
     # 不論來源欄位配置為何，統一正規化與刻度換算
     normalized = _normalize_rows(payload)
+    # 若剛好是 worker_id/percent_mvc/timestamp 三欄，就直通；不然正規化
+    normalized = payload if _looks_like_plain_avg(payload) else _normalize_rows(payload)
 
     if not normalized:
         raise HTTPException(400, detail="空的上傳資料")
