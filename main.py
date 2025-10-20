@@ -4,9 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
-import subprocess
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import joblib
@@ -49,43 +47,6 @@ except Exception:
 
 # 台灣時區
 TZ_TAIWAN = timezone(timedelta(hours=8))
-
-
-def _detect_build() -> str:
-    """Return best-effort build identifier for health checks."""
-
-    for key in ("APP_BUILD", "RENDER_GIT_COMMIT", "GIT_COMMIT", "COMMIT_SHA"):
-        val = os.environ.get(key)
-        if val:
-            return val
-
-    try:
-        sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL)
-        decoded = sha.decode().strip()
-        if decoded:
-            return decoded
-    except Exception:
-        pass
-
-    try:
-        head_path = Path(".git/HEAD")
-        if head_path.is_file():
-            head_ref = head_path.read_text().strip()
-            if head_ref.startswith("ref:"):
-                ref_path = Path(".git") / head_ref.split(" ", 1)[1]
-                if ref_path.is_file():
-                    ref_sha = ref_path.read_text().strip()
-                    if ref_sha:
-                        return ref_sha[:7]
-            elif head_ref:
-                return head_ref[:7]
-    except Exception:
-        pass
-
-    return "unknown"
-
-
-APP_BUILD = _detect_build()
 
 
 def now_taiwan_iso() -> str:
@@ -301,6 +262,23 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         raw_mvc_values.append(raw_mvc)
 
         # 時間
+    out: List[Dict[str, Any]] = []
+    for m in rows:
+        mm = dict(m)
+
+        raw_wid = mm.get("worker_id") or DEFAULT_WORKER_ID
+        worker_id = str(raw_wid).strip()
+
+        # MVC
+        mvc = None
+        for k in ("percent_mvc", "MVC", "mvc", "emg_pct"):
+            if k in mm and mvc is None:
+                mvc = _to_mvc_0_100(mm.get(k))
+        if mvc is None:
+            # 沒給 MVC 也允許（例如純 RMS），但 /upload/process_json 仍會接受
+            pass
+
+        # 時間
         if "timestamp" in mm and mm["timestamp"]:
             ts_sec = _to_ts_sec(mm["timestamp"])
         else:
@@ -471,7 +449,6 @@ def health():
         "db": {"path": DB_PATH, "total_records": total},
         "models": {"rf_loaded": RF_MODEL is not None},
         "version": "v1.1",
-        "build": APP_BUILD,
     }
 
 
@@ -515,6 +492,8 @@ def process_json(rows: Union[List[Dict[str, Any]], Dict[str, Any]]):
 
     # 不論來源欄位配置為何，統一正規化與刻度換算
     normalized = _normalize_rows(payload)
+    # 若剛好是 worker_id/percent_mvc/timestamp 三欄，就直通；不然正規化
+    normalized = payload if _looks_like_plain_avg(payload) else _normalize_rows(payload)
 
     if not normalized:
         raise HTTPException(400, detail="空的上傳資料")
