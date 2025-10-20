@@ -420,6 +420,7 @@ def home():
     return {
         "service": APP_TITLE,
         "version": "v1.1",
+        "build": APP_BUILD,
         "endpoints": {
             "健康檢查": "GET /healthz",
             "總覽": "GET /health",
@@ -433,7 +434,7 @@ def home():
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    return {"status": "ok", "build": APP_BUILD}
 
 
 @app.get("/health")
