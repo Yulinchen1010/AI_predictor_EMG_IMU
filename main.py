@@ -34,6 +34,17 @@ DEFAULT_WORKER_ID = os.environ.get("DEFAULT_WORKER_ID", "user001")
 RISK_LABELS = ["低度", "中度", "高度"]
 RISK_COLORS = ["#18b358", "#f1a122", "#e74533"]  # 綠、橘、紅
 
+# MCU / 感測器輸出的最大值提示（若無設定，稍後會依資料自動推斷）
+try:
+    _sensor_max_env = os.environ.get("MVC_SENSOR_MAX")
+    MVC_SENSOR_MAX_HINT: Optional[float] = None
+    if _sensor_max_env is not None:
+        candidate = float(_sensor_max_env)
+        if candidate > 0:
+            MVC_SENSOR_MAX_HINT = candidate
+except Exception:
+    MVC_SENSOR_MAX_HINT = None
+
 # 台灣時區
 TZ_TAIWAN = timezone(timedelta(hours=8))
 
@@ -160,15 +171,52 @@ def _to_ts_sec(v: Any) -> float:
         return datetime.utcnow().timestamp()
 
 
-def _to_mvc_0_100(v: Any) -> Optional[float]:
-    if v is None:
-        return None
+def _clean_numeric(v: Any) -> Optional[float]:
     try:
-        x = float(v)
-        # 容忍 0~1 與 0~100 兩種表示
-        return x * 100.0 if x <= 1.0 else x
+        if v is None:
+            return None
+        return float(v)
     except Exception:
         return None
+
+
+def _infer_mvc_scale(values: List[Optional[float]]) -> float:
+    """根據資料決定原始 MVC 的最大刻度。"""
+
+    if MVC_SENSOR_MAX_HINT:
+        return MVC_SENSOR_MAX_HINT
+
+    cleaned = [float(x) for x in values if x is not None]
+    if not cleaned:
+        return 100.0
+
+    max_val = max(cleaned)
+    if max_val <= 1.0:
+        return 1.0
+    if max_val <= 20.0:
+        return 20.0
+    if max_val <= 120.0:
+        return 100.0
+    return max(100.0, max_val)
+
+
+def _mvc_to_percent(raw_value: float, scale: float) -> float:
+    if raw_value is None:
+        return 0.0
+    try:
+        value = float(raw_value)
+    except Exception:
+        return 0.0
+
+    scale = float(scale) if scale and scale > 0 else 100.0
+    if scale == 1.0:
+        percent = value * 100.0
+    else:
+        percent = (value / scale) * 100.0
+    if percent < 0:
+        percent = 0.0
+    # 允許些微超過 100，避免在推斷刻度時過度截斷
+    return float(min(percent, 120.0))
 
 
 def _to_float(v: Any) -> Optional[float]:
@@ -188,27 +236,6 @@ def _ensure_json_array(rows: Union[Dict[str, Any], List[Dict[str, Any]]]) -> Lis
     raise HTTPException(400, detail="rows 必須是物件或物件陣列")
 
 
-def _looks_like_plain_avg(rows: List[Dict[str, Any]]) -> bool:
-    """
-    只包含：worker_id / percent_mvc / timestamp 三欄（全部皆有）
-    """
-    allowed = {"worker_id", "percent_mvc", "timestamp"}
-    for m in rows:
-        keys = set(m.keys())
-        if keys != allowed:
-            return False
-        # 型別粗檢
-        if "worker_id" not in m or "percent_mvc" not in m or "timestamp" not in m:
-            return False
-        pmv = m["percent_mvc"]
-        ts = m["timestamp"]
-        pmv_ok = isinstance(pmv, (int, float)) or (isinstance(pmv, str) and _to_float(pmv) is not None)
-        ts_ok = isinstance(ts, str)
-        if not (pmv_ok and ts_ok):
-            return False
-    return True
-
-
 def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     容錯鍵名並轉成 DB 欄位：
@@ -219,6 +246,22 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     - rms：容忍 RMS/emg_rms/rms/emg
     - type：原樣保留
     """
+    out: List[Dict[str, Any]] = []
+    raw_mvc_values: List[Optional[float]] = []
+    for m in rows:
+        mm = dict(m)
+
+        raw_wid = mm.get("worker_id") or DEFAULT_WORKER_ID
+        worker_id = str(raw_wid).strip()
+
+        # MVC
+        raw_mvc = None
+        for k in ("percent_mvc", "MVC", "mvc", "emg_pct"):
+            if k in mm and raw_mvc is None:
+                raw_mvc = _clean_numeric(mm.get(k))
+        raw_mvc_values.append(raw_mvc)
+
+        # 時間
     out: List[Dict[str, Any]] = []
     for m in rows:
         mm = dict(m)
@@ -256,12 +299,18 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             {
                 "worker_id": worker_id,
                 "timestamp": iso,
-                "percent_mvc": mvc if mvc is not None else 0.0,
+                "percent_mvc": 0.0,
                 "ts": ts_sec,
                 "rms": rms,
                 "type": typ,
             }
         )
+
+    scale = _infer_mvc_scale(raw_mvc_values)
+    for row, raw_mvc in zip(out, raw_mvc_values):
+        if raw_mvc is None:
+            continue
+        row["percent_mvc"] = _mvc_to_percent(raw_mvc, scale)
     return out
 
 
@@ -440,6 +489,8 @@ def get_app_data():
 def process_json(rows: Union[List[Dict[str, Any]], Dict[str, Any]]):
     payload = _ensure_json_array(rows)
 
+    # 不論來源欄位配置為何，統一正規化與刻度換算
+    normalized = _normalize_rows(payload)
     # 若剛好是 worker_id/percent_mvc/timestamp 三欄，就直通；不然正規化
     normalized = payload if _looks_like_plain_avg(payload) else _normalize_rows(payload)
 
