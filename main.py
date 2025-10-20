@@ -401,43 +401,97 @@ def _get_df(worker_id: str, limit: int = 600, exclude_heartbeat: bool = True) ->
     return df
 
 
+# def _extract_features(df: pd.DataFrame) -> Optional[np.ndarray]:
+#     """
+#     只用 percent_mvc 的時間序列特徵：
+#     current_mvc, total_change(初始到當前降幅), change_rate(最近10筆/分鐘),
+#     avg_mvc, std_mvc
+#     - 過濾 heartbeat 與近似 0 的 %MVC
+#     """
+#     if df.empty:
+#         return None
+
+#     # 防守性：二次過濾
+#     if "type" in df.columns:
+#         df = df[df["type"].ne(HEARTBEAT_TYPE)]
+
+#     df = df[df["percent_mvc"] > MIN_EFFECTIVE_PCT].copy()
+#     if len(df) < 2:
+#         return None
+
+#     first_mvc = float(df.iloc[0]["percent_mvc"])
+#     last_mvc = float(df.iloc[-1]["percent_mvc"])
+#     initial_mvc = max(first_mvc, float(df["percent_mvc"].max()))
+#     current_mvc = last_mvc
+#     total_change = float(initial_mvc - current_mvc)
+
+#     recent = df.tail(min(10, len(df)))
+#     if len(recent) >= 2:
+#         dt_min = (recent.iloc[-1]["timestamp"] - recent.iloc[0]["timestamp"]).total_seconds() / 60.0
+#         dv = float(recent.iloc[0]["percent_mvc"] - recent.iloc[-1]["percent_mvc"])
+#         change_rate = float(dv / dt_min) if dt_min > 0 else 0.0
+#     else:
+#         change_rate = 0.0
+
+#     avg_mvc = float(df["percent_mvc"].mean())
+#     std_mvc = float(df["percent_mvc"].std(ddof=0))
+
+#     X = np.array([[current_mvc, total_change, change_rate, avg_mvc, std_mvc]])
+#     return X
+
 def _extract_features(df: pd.DataFrame) -> Optional[np.ndarray]:
-    """
-    只用 percent_mvc 的時間序列特徵：
-    current_mvc, total_change(初始到當前降幅), change_rate(最近10筆/分鐘),
-    avg_mvc, std_mvc
-    - 過濾 heartbeat 與近似 0 的 %MVC
-    """
-    if df.empty:
-        return None
-
-    # 防守性：二次過濾
-    if "type" in df.columns:
-        df = df[df["type"].ne(HEARTBEAT_TYPE)]
-
-    df = df[df["percent_mvc"] > MIN_EFFECTIVE_PCT].copy()
     if len(df) < 2:
         return None
 
+    # 整理 & 保險
+    df = df.dropna(subset=["timestamp", "percent_mvc"]).copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["ts_sec"] = df["timestamp"].astype("int64") / 1e9  # UNIX 秒
+
+    # --- 1) 用較長的時間窗估變化速率（預設 5 分鐘；不足則退回最多 30 筆）---
+    t_end = df["timestamp"].iloc[-1]
+    window = df[df["timestamp"] >= t_end - pd.Timedelta(minutes=5)]
+    if len(window) < 5:
+        window = df.tail(min(30, len(df)))
+
+    # --- 2) 其他特徵 ---
     first_mvc = float(df.iloc[0]["percent_mvc"])
     last_mvc = float(df.iloc[-1]["percent_mvc"])
     initial_mvc = max(first_mvc, float(df["percent_mvc"].max()))
     current_mvc = last_mvc
     total_change = float(initial_mvc - current_mvc)
 
-    recent = df.tail(min(10, len(df)))
-    if len(recent) >= 2:
-        dt_min = (recent.iloc[-1]["timestamp"] - recent.iloc[0]["timestamp"]).total_seconds() / 60.0
-        dv = float(recent.iloc[0]["percent_mvc"] - recent.iloc[-1]["percent_mvc"])
-        change_rate = float(dv / dt_min) if dt_min > 0 else 0.0
+    # --- 3) 用最小二乘回歸算斜率（%/min），並做穩定化 ---
+    if len(window) >= 2:
+        x = (window["ts_sec"] - window["ts_sec"].iloc[0]).to_numpy()  # 秒差（從 0 開始）
+        y = window["percent_mvc"].to_numpy()
+
+        span_min = (x[-1] - x[0]) / 60.0  # 窗口涵蓋的分鐘數
+        if span_min <= 0:
+            change_rate = 0.0
+        else:
+            # 中心化後的一元線性回歸斜率（%/秒）
+            x_c = x - x.mean()
+            y_c = y - y.mean()
+            denom = float((x_c * x_c).sum())
+            slope_per_sec = float((x_c * y_c).sum() / denom) if denom > 0 else 0.0
+            change_rate = slope_per_sec * 60.0  # 換成 %/min
+
+            # 針對秒級資料，速率做鉗制避免“爆衝”
+            # 依你目前資料分佈，±2 %/min 已足夠區分，超過視為雜訊
+            change_rate = float(np.clip(change_rate, -2.0, 2.0))
     else:
         change_rate = 0.0
 
-    avg_mvc = float(df["percent_mvc"].mean())
-    std_mvc = float(df["percent_mvc"].std(ddof=0))
+    # --- 4) 均值/波動 ---
+    avg_mvc = float(window["percent_mvc"].mean())
+    std_mvc = float(window["percent_mvc"].std(ddof=0)) if len(window) > 1 else 0.0
 
+    # 和訓練時的特徵順序一致
     X = np.array([[current_mvc, total_change, change_rate, avg_mvc, std_mvc]])
     return X
+
 
 
 def _predict_risk(features: np.ndarray) -> Tuple[str, int, str, np.ndarray]:
@@ -674,4 +728,5 @@ if __name__ == "__main__":
     print("➡️  查詢狀態:   GET  http://localhost:8000/status/user001")
     print("➡️  App 簡化:   GET  http://localhost:8000/app_data")
     print("\n啟動：uvicorn main:app --reload --host 0.0.0.0 --port 8000")
+
 
