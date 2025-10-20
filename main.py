@@ -20,6 +20,7 @@ from sklearn.model_selection import train_test_split
 # ==================== 基本設定 ====================
 APP_TITLE = "疲勞預測系統"
 DB_PATH = os.environ.get("DB_PATH", "fatigue_data.db")
+APP_BUILD = os.environ.get("APP_BUILD", datetime.utcnow().isoformat(timespec="seconds"))
 
 # 模型檔案
 MODEL_DIR = os.environ.get("MODEL_DIR", "models")
@@ -98,21 +99,18 @@ def init_db() -> None:
         )
         """
     )
-    try:
-        c.execute("ALTER TABLE sensor_data ADD COLUMN rms REAL")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE sensor_data ADD COLUMN ts REAL")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE sensor_data ADD COLUMN type TEXT")
-    except Exception:
-        pass
-    c.execute(
-        "CREATE INDEX IF NOT EXISTS idx_worker_ts ON sensor_data(worker_id, timestamp)"
-    )
+    # 容錯：欄位已存在就跳過
+    for ddl in (
+        "ALTER TABLE sensor_data ADD COLUMN rms REAL",
+        "ALTER TABLE sensor_data ADD COLUMN ts REAL",
+        "ALTER TABLE sensor_data ADD COLUMN type TEXT",
+    ):
+        try:
+            c.execute(ddl)
+        except Exception:
+            pass
+
+    c.execute("CREATE INDEX IF NOT EXISTS idx_worker_ts ON sensor_data(worker_id, timestamp)")
     conn.commit()
     conn.close()
 
@@ -182,7 +180,6 @@ def _clean_numeric(v: Any) -> Optional[float]:
 
 def _infer_mvc_scale(values: List[Optional[float]]) -> float:
     """根據資料決定原始 MVC 的最大刻度。"""
-
     if MVC_SENSOR_MAX_HINT:
         return MVC_SENSOR_MAX_HINT
 
@@ -191,6 +188,7 @@ def _infer_mvc_scale(values: List[Optional[float]]) -> float:
         return 100.0
 
     max_val = max(cleaned)
+    # 常見 0~1、0~20、0~100 三種；再來就用最大值推估
     if max_val <= 1.0:
         return 1.0
     if max_val <= 20.0:
@@ -200,7 +198,7 @@ def _infer_mvc_scale(values: List[Optional[float]]) -> float:
     return max(100.0, max_val)
 
 
-def _mvc_to_percent(raw_value: float, scale: float) -> float:
+def _mvc_to_percent(raw_value: Optional[float], scale: float) -> float:
     if raw_value is None:
         return 0.0
     try:
@@ -240,46 +238,30 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     容錯鍵名並轉成 DB 欄位：
     - worker_id：預設 DEFAULT_WORKER_ID
-    - percent_mvc：容忍 MVC(0..1/0..100)、percent_mvc、mvc、emg_pct
+    - percent_mvc：容忍 MVC(0..1/0..100)、percent_mvc、mvc、emg_pct（自動推斷刻度）
     - timestamp：ISO；若沒給，用 ts（秒）或現在
     - ts：UNIX 秒
     - rms：容忍 RMS/emg_rms/rms/emg
     - type：原樣保留
     """
-    out: List[Dict[str, Any]] = []
+    base_rows: List[Dict[str, Any]] = []
     raw_mvc_values: List[Optional[float]] = []
+
     for m in rows:
         mm = dict(m)
 
-        raw_wid = mm.get("worker_id") or DEFAULT_WORKER_ID
-        worker_id = str(raw_wid).strip()
+        # worker
+        worker_id = str(mm.get("worker_id") or DEFAULT_WORKER_ID).strip()
 
-        # MVC
-        raw_mvc = None
+        # MVC 原始值（先收集，用來推斷刻度）
+        raw_mvc: Optional[float] = None
         for k in ("percent_mvc", "MVC", "mvc", "emg_pct"):
             if k in mm and raw_mvc is None:
                 raw_mvc = _clean_numeric(mm.get(k))
         raw_mvc_values.append(raw_mvc)
 
         # 時間
-    out: List[Dict[str, Any]] = []
-    for m in rows:
-        mm = dict(m)
-
-        raw_wid = mm.get("worker_id") or DEFAULT_WORKER_ID
-        worker_id = str(raw_wid).strip()
-
-        # MVC
-        mvc = None
-        for k in ("percent_mvc", "MVC", "mvc", "emg_pct"):
-            if k in mm and mvc is None:
-                mvc = _to_mvc_0_100(mm.get(k))
-        if mvc is None:
-            # 沒給 MVC 也允許（例如純 RMS），但 /upload/process_json 仍會接受
-            pass
-
-        # 時間
-        if "timestamp" in mm and mm["timestamp"]:
+        if mm.get("timestamp"):
             ts_sec = _to_ts_sec(mm["timestamp"])
         else:
             ts_sec = _to_ts_sec(mm.get("ts"))
@@ -295,23 +277,23 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         typ = mm.get("type")
         typ = str(typ) if typ is not None else None
 
-        out.append(
+        base_rows.append(
             {
                 "worker_id": worker_id,
                 "timestamp": iso,
-                "percent_mvc": 0.0,
+                "percent_mvc": 0.0,  # 暫存，稍後用 scale 轉換
                 "ts": ts_sec,
                 "rms": rms,
                 "type": typ,
             }
         )
 
+    # 依蒐集到的原始值推斷刻度，並換算到百分比
     scale = _infer_mvc_scale(raw_mvc_values)
-    for row, raw_mvc in zip(out, raw_mvc_values):
-        if raw_mvc is None:
-            continue
+    for row, raw_mvc in zip(base_rows, raw_mvc_values):
         row["percent_mvc"] = _mvc_to_percent(raw_mvc, scale)
-    return out
+
+    return base_rows
 
 
 # ==================== 模型（載入/訓練） ====================
@@ -449,6 +431,7 @@ def health():
         "db": {"path": DB_PATH, "total_records": total},
         "models": {"rf_loaded": RF_MODEL is not None},
         "version": "v1.1",
+        "build": APP_BUILD,
     }
 
 
@@ -489,14 +472,11 @@ def get_app_data():
 @app.post("/process_json")
 def process_json(rows: Union[List[Dict[str, Any]], Dict[str, Any]]):
     payload = _ensure_json_array(rows)
-
-    # 不論來源欄位配置為何，統一正規化與刻度換算
-    normalized = _normalize_rows(payload)
-    # 若剛好是 worker_id/percent_mvc/timestamp 三欄，就直通；不然正規化
-    normalized = payload if _looks_like_plain_avg(payload) else _normalize_rows(payload)
-
-    if not normalized:
+    if not payload:
         raise HTTPException(400, detail="空的上傳資料")
+
+    # 一律正規化與刻度換算
+    normalized = _normalize_rows(payload)
 
     conn = get_conn()
     c = conn.cursor()
@@ -627,6 +607,7 @@ if __name__ == "__main__":
     print("🚀 疲勞預測系統啟動")
     print(f"📦 DB: {DB_PATH}")
     print(f"👤 預設使用者: {DEFAULT_WORKER_ID}")
+    print(f"🧱 BUILD: {APP_BUILD}")
     print("📍 本機: http://localhost:8000")
     print("➡️  健康檢查:   GET http://localhost:8000/healthz")
     print("➡️  批次上傳:   POST http://localhost:8000/process_json")
