@@ -1,16 +1,20 @@
 # main.py
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
+import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
@@ -32,8 +36,56 @@ DEFAULT_WORKER_ID = os.environ.get("DEFAULT_WORKER_ID", "user001")
 RISK_LABELS = ["低度", "中度", "高度"]
 RISK_COLORS = ["#18b358", "#f1a122", "#e74533"]  # 綠、橘、紅
 
+# MCU / 感測器輸出的最大值提示（若無設定，稍後會依資料自動推斷）
+try:
+    _sensor_max_env = os.environ.get("MVC_SENSOR_MAX")
+    MVC_SENSOR_MAX_HINT: Optional[float] = None
+    if _sensor_max_env is not None:
+        candidate = float(_sensor_max_env)
+        if candidate > 0:
+            MVC_SENSOR_MAX_HINT = candidate
+except Exception:
+    MVC_SENSOR_MAX_HINT = None
+
 # 台灣時區
 TZ_TAIWAN = timezone(timedelta(hours=8))
+
+
+def _detect_build() -> str:
+    """Return best-effort build identifier for health checks."""
+
+    for key in ("APP_BUILD", "RENDER_GIT_COMMIT", "GIT_COMMIT", "COMMIT_SHA"):
+        val = os.environ.get(key)
+        if val:
+            return val
+
+    try:
+        sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL)
+        decoded = sha.decode().strip()
+        if decoded:
+            return decoded
+    except Exception:
+        pass
+
+    try:
+        head_path = Path(".git/HEAD")
+        if head_path.is_file():
+            head_ref = head_path.read_text().strip()
+            if head_ref.startswith("ref:"):
+                ref_path = Path(".git") / head_ref.split(" ", 1)[1]
+                if ref_path.is_file():
+                    ref_sha = ref_path.read_text().strip()
+                    if ref_sha:
+                        return ref_sha[:7]
+            elif head_ref:
+                return head_ref[:7]
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+APP_BUILD = _detect_build()
 
 
 def now_taiwan_iso() -> str:
@@ -54,8 +106,22 @@ app.add_middleware(
 )
 
 # ==================== DB ====================
+logger = logging.getLogger("uvicorn.error")
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=5.0, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+    except Exception:
+        pass
+    return conn
+
+
 def init_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     # 擴充欄位但相容：必填 worker_id / timestamp / percent_mvc
     c.execute(
@@ -71,6 +137,18 @@ def init_db() -> None:
         )
         """
     )
+    try:
+        c.execute("ALTER TABLE sensor_data ADD COLUMN rms REAL")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE sensor_data ADD COLUMN ts REAL")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE sensor_data ADD COLUMN type TEXT")
+    except Exception:
+        pass
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_worker_ts ON sensor_data(worker_id, timestamp)"
     )
@@ -79,6 +157,38 @@ def init_db() -> None:
 
 
 init_db()
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    body = await request.body()
+    logger.info(
+        f"[REQ] {request.method} {request.url.path} q={dict(request.query_params)} "
+        f"len={len(body)} ct={request.headers.get('content-type')}"
+    )
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        try:
+            status_code = getattr(response, "status_code", "n/a")
+        except UnboundLocalError:
+            status_code = "n/a"
+        logger.info(f"[RESP] {request.method} {request.url.path} -> {status_code}")
+
+
+@app.exception_handler(Exception)
+async def unhandled_ex_handler(request: Request, exc: Exception):
+    import traceback
+
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logger.error(f"[UNHANDLED] {request.url.path} {exc}\n{tb}")
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if not isinstance(detail, dict):
+            detail = {"detail": detail}
+        return JSONResponse(status_code=exc.status_code, content=detail, headers=exc.headers)
+    return JSONResponse(status_code=500, content={"error": "internal_error", "detail": str(exc)})
 
 # ==================== 請求模型 ====================
 class SensorData(BaseModel):
@@ -100,15 +210,52 @@ def _to_ts_sec(v: Any) -> float:
         return datetime.utcnow().timestamp()
 
 
-def _to_mvc_0_100(v: Any) -> Optional[float]:
-    if v is None:
-        return None
+def _clean_numeric(v: Any) -> Optional[float]:
     try:
-        x = float(v)
-        # 容忍 0~1 與 0~100 兩種表示
-        return x * 100.0 if x <= 1.0 else x
+        if v is None:
+            return None
+        return float(v)
     except Exception:
         return None
+
+
+def _infer_mvc_scale(values: List[Optional[float]]) -> float:
+    """根據資料決定原始 MVC 的最大刻度。"""
+
+    if MVC_SENSOR_MAX_HINT:
+        return MVC_SENSOR_MAX_HINT
+
+    cleaned = [float(x) for x in values if x is not None]
+    if not cleaned:
+        return 100.0
+
+    max_val = max(cleaned)
+    if max_val <= 1.0:
+        return 1.0
+    if max_val <= 20.0:
+        return 20.0
+    if max_val <= 120.0:
+        return 100.0
+    return max(100.0, max_val)
+
+
+def _mvc_to_percent(raw_value: float, scale: float) -> float:
+    if raw_value is None:
+        return 0.0
+    try:
+        value = float(raw_value)
+    except Exception:
+        return 0.0
+
+    scale = float(scale) if scale and scale > 0 else 100.0
+    if scale == 1.0:
+        percent = value * 100.0
+    else:
+        percent = (value / scale) * 100.0
+    if percent < 0:
+        percent = 0.0
+    # 允許些微超過 100，避免在推斷刻度時過度截斷
+    return float(min(percent, 120.0))
 
 
 def _to_float(v: Any) -> Optional[float]:
@@ -128,27 +275,6 @@ def _ensure_json_array(rows: Union[Dict[str, Any], List[Dict[str, Any]]]) -> Lis
     raise HTTPException(400, detail="rows 必須是物件或物件陣列")
 
 
-def _looks_like_plain_avg(rows: List[Dict[str, Any]]) -> bool:
-    """
-    只包含：worker_id / percent_mvc / timestamp 三欄（全部皆有）
-    """
-    allowed = {"worker_id", "percent_mvc", "timestamp"}
-    for m in rows:
-        keys = set(m.keys())
-        if keys != allowed:
-            return False
-        # 型別粗檢
-        if "worker_id" not in m or "percent_mvc" not in m or "timestamp" not in m:
-            return False
-        pmv = m["percent_mvc"]
-        ts = m["timestamp"]
-        pmv_ok = isinstance(pmv, (int, float)) or (isinstance(pmv, str) and _to_float(pmv) is not None)
-        ts_ok = isinstance(ts, str)
-        if not (pmv_ok and ts_ok):
-            return False
-    return True
-
-
 def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     容錯鍵名並轉成 DB 欄位：
@@ -160,27 +286,26 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     - type：原樣保留
     """
     out: List[Dict[str, Any]] = []
+    raw_mvc_values: List[Optional[float]] = []
     for m in rows:
         mm = dict(m)
 
-        worker_id = (mm.get("worker_id") or DEFAULT_WORKER_ID).strip()
+        raw_wid = mm.get("worker_id") or DEFAULT_WORKER_ID
+        worker_id = str(raw_wid).strip()
 
         # MVC
-        mvc = None
+        raw_mvc = None
         for k in ("percent_mvc", "MVC", "mvc", "emg_pct"):
-            if k in mm and mvc is None:
-                mvc = _to_mvc_0_100(mm.get(k))
-        if mvc is None:
-            # 沒給 MVC 也允許（例如純 RMS），但 /upload/process_json 仍會接受
-            pass
+            if k in mm and raw_mvc is None:
+                raw_mvc = _clean_numeric(mm.get(k))
+        raw_mvc_values.append(raw_mvc)
 
         # 時間
         if "timestamp" in mm and mm["timestamp"]:
             ts_sec = _to_ts_sec(mm["timestamp"])
-            iso = datetime.utcfromtimestamp(ts_sec).replace(tzinfo=timezone.utc).isoformat()
         else:
             ts_sec = _to_ts_sec(mm.get("ts"))
-            iso = datetime.utcfromtimestamp(ts_sec).replace(tzinfo=timezone.utc).isoformat()
+        iso = datetime.utcfromtimestamp(ts_sec).replace(tzinfo=timezone.utc).isoformat()
 
         # RMS（可選）
         rms = None
@@ -196,12 +321,18 @@ def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             {
                 "worker_id": worker_id,
                 "timestamp": iso,
-                "percent_mvc": mvc if mvc is not None else 0.0,
+                "percent_mvc": 0.0,
                 "ts": ts_sec,
                 "rms": rms,
                 "type": typ,
             }
         )
+
+    scale = _infer_mvc_scale(raw_mvc_values)
+    for row, raw_mvc in zip(out, raw_mvc_values):
+        if raw_mvc is None:
+            continue
+        row["percent_mvc"] = _mvc_to_percent(raw_mvc, scale)
     return out
 
 
@@ -251,15 +382,15 @@ RF_MODEL: RandomForestClassifier = _load_or_train_rf()
 
 # ==================== 特徵計算 & 風險評分 ====================
 def _get_df(worker_id: str, limit: int = 600) -> pd.DataFrame:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     df = pd.read_sql_query(
         "SELECT * FROM sensor_data WHERE worker_id = ? ORDER BY timestamp DESC LIMIT ?",
         conn,
-        params=(worker_id, limit),
+        params=(worker_id, int(limit)),
     )
     conn.close()
     if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
         df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
@@ -311,6 +442,7 @@ def home():
     return {
         "service": APP_TITLE,
         "version": "v1.1",
+        "build": APP_BUILD,
         "endpoints": {
             "健康檢查": "GET /healthz",
             "總覽": "GET /health",
@@ -324,12 +456,12 @@ def home():
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    return {"status": "ok", "build": APP_BUILD}
 
 
 @app.get("/health")
 def health():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM sensor_data")
     total = c.fetchone()[0]
@@ -339,6 +471,7 @@ def health():
         "db": {"path": DB_PATH, "total_records": total},
         "models": {"rf_loaded": RF_MODEL is not None},
         "version": "v1.1",
+        "build": APP_BUILD,
     }
 
 
@@ -348,7 +481,7 @@ def upload(item: SensorData):
     worker_id = DEFAULT_WORKER_ID
     ts_iso = item.timestamp or now_taiwan_iso()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute(
         "INSERT INTO sensor_data(worker_id, timestamp, percent_mvc, ts, rms, type) VALUES(?,?,?,?,?,?)",
@@ -380,37 +513,43 @@ def get_app_data():
 def process_json(rows: Union[List[Dict[str, Any]], Dict[str, Any]]):
     payload = _ensure_json_array(rows)
 
-    # 若剛好是 worker_id/percent_mvc/timestamp 三欄，就直通；不然正規化
-    normalized = payload if _looks_like_plain_avg(payload) else _normalize_rows(payload)
+    # 不論來源欄位配置為何，統一正規化與刻度換算
+    normalized = _normalize_rows(payload)
 
     if not normalized:
         raise HTTPException(400, detail="空的上傳資料")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     inserted = 0
     last_worker = None
 
-    for r in normalized:
-        worker_id = (r.get("worker_id") or DEFAULT_WORKER_ID).strip()
-        ts_iso = r.get("timestamp") or now_taiwan_iso()
-        pmv = r.get("percent_mvc")
-        pmv = float(pmv) if pmv is not None else 0.0
-        ts_sec = r.get("ts")
-        ts_sec = float(ts_sec) if ts_sec is not None else None
-        rms = r.get("rms")
-        rms = float(rms) if rms is not None else None
-        typ = r.get("type")
+    try:
+        for r in normalized:
+            worker_id = str((r.get("worker_id") or DEFAULT_WORKER_ID)).strip()
+            ts_iso = r.get("timestamp") or now_taiwan_iso()
+            pmv = r.get("percent_mvc")
+            pmv = float(pmv) if pmv is not None else 0.0
+            ts_sec = r.get("ts")
+            ts_sec = float(ts_sec) if ts_sec is not None else None
+            rms = r.get("rms")
+            rms = float(rms) if rms is not None else None
+            typ = r.get("type")
 
-        c.execute(
-            "INSERT INTO sensor_data(worker_id, timestamp, percent_mvc, ts, rms, type) VALUES(?,?,?,?,?,?)",
-            (worker_id, ts_iso, pmv, ts_sec, rms, typ),
-        )
-        inserted += 1
-        last_worker = worker_id
-
-    conn.commit()
-    conn.close()
+            c.execute(
+                "INSERT INTO sensor_data(worker_id, timestamp, percent_mvc, ts, rms, type) VALUES(?,?,?,?,?,?)",
+                (worker_id, ts_iso, pmv, ts_sec, rms, typ),
+            )
+            inserted += 1
+            last_worker = worker_id
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        raise HTTPException(status_code=503, detail=f"db_error: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     # 回傳同時附上最新風險等級（方便 App 立即更新）
     if last_worker is None:
@@ -446,7 +585,7 @@ def process_json(rows: Union[List[Dict[str, Any]], Dict[str, Any]]):
 # ---- 查詢狀態（App 拉心跳/狀態用）----
 @app.get("/status/{worker_id}")
 def status(worker_id: str):
-    wid = (worker_id or DEFAULT_WORKER_ID).strip()
+    wid = str((worker_id or DEFAULT_WORKER_ID)).strip()
     df = _get_df(wid, limit=120)
     if df.empty:
         return {
@@ -494,8 +633,8 @@ def status(worker_id: str):
 # ---- 清空資料（測試用）----
 @app.delete("/clear/{worker_id}")
 def clear(worker_id: str):
-    wid = (worker_id or DEFAULT_WORKER_ID).strip()
-    conn = sqlite3.connect(DB_PATH)
+    wid = str((worker_id or DEFAULT_WORKER_ID)).strip()
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM sensor_data WHERE worker_id = ?", (wid,))
     deleted = c.rowcount
