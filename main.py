@@ -153,13 +153,17 @@ async def log_requests(request: Request, call_next):
 async def unhandled_ex_handler(request: Request, exc: Exception):
     import traceback
 
-    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     logger.error(f"[UNHANDLED] {request.url.path} {exc}\n{tb}")
     if isinstance(exc, HTTPException):
         detail = exc.detail
         if not isinstance(detail, dict):
             detail = {"detail": detail}
-        return JSONResponse(status_code=exc.status_code, content=detail, headers=getattr(exc, "headers", None))
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=detail,
+            headers=getattr(exc, "headers", None),
+        )
     return JSONResponse(status_code=500, content={"error": "internal_error", "detail": str(exc)})
 
 
@@ -670,3 +674,4 @@ if __name__ == "__main__":
     print("➡️  查詢狀態:   GET  http://localhost:8000/status/user001")
     print("➡️  App 簡化:   GET  http://localhost:8000/app_data")
     print("\n啟動：uvicorn main:app --reload --host 0.0.0.0 --port 8000")
+
